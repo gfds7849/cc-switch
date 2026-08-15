@@ -94,8 +94,6 @@ pub fn set_app_config_dir_to_store(
     app: &tauri::AppHandle,
     path: Option<&str>,
 ) -> Result<(), AppError> {
-    crate::portable::require_external_write("update app config directory Store override")
-        .map_err(AppError::Message)?;
 
     let store = app
         .store_builder("app_paths.json")
