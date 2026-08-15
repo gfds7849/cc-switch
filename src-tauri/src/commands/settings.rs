@@ -196,6 +196,7 @@ pub async fn restart_app(app: AppHandle) -> Result<bool, String> {
 /// 这里把退出清理、安装和重启串在同一个后端流程中，避免依赖旧前端继续执行。
 #[tauri::command]
 pub async fn install_update_and_restart(app: AppHandle) -> Result<bool, String> {
+    crate::portable::require_external_write("install application update")?;
     let updater = app
         .updater_builder()
         .build()
@@ -304,6 +305,7 @@ pub async fn set_app_config_dir_override(
 /// 设置开机自启
 #[tauri::command]
 pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
+    crate::portable::require_external_write("change auto-launch registration")?;
     if enabled {
         crate::auto_launch::enable_auto_launch().map_err(|e| format!("启用开机自启失败: {e}"))?;
     } else {
@@ -623,6 +625,9 @@ mod tests {
 /// 获取开机自启状态
 #[tauri::command]
 pub async fn get_auto_launch_status() -> Result<bool, String> {
+    if crate::portable::is_portable() {
+        return Ok(false);
+    }
     crate::auto_launch::is_auto_launch_enabled().map_err(|e| format!("获取开机自启状态失败: {e}"))
 }
 

@@ -1,7 +1,9 @@
 #![allow(non_snake_case)]
 
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
@@ -27,6 +29,184 @@ where
 
 // ─── File import/export ──────────────────────────────────────
 
+const PORTABLE_EXPORT_FALLBACK_FILE: &str = "cc-switch-export.sql";
+
+fn is_windows_reserved_file_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default();
+    let upper = stem.to_ascii_uppercase();
+
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || upper
+            .strip_prefix("COM")
+            .or_else(|| upper.strip_prefix("LPT"))
+            .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
+}
+
+fn safe_portable_export_file_name(default_name: &str) -> String {
+    let candidate = default_name
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let invalid = candidate.is_empty()
+        || matches!(candidate, "." | "..")
+        || candidate.len() > 240
+        || candidate.ends_with(' ')
+        || candidate.ends_with('.')
+        || candidate
+            .chars()
+            .any(|character| character.is_control() || r#"<>:"|?*"#.contains(character))
+        || is_windows_reserved_file_name(candidate);
+
+    if invalid {
+        PORTABLE_EXPORT_FALLBACK_FILE.to_string()
+    } else {
+        candidate.to_string()
+    }
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("export target must be an absolute path".to_string());
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err("export target must not contain parent-directory traversal".to_string());
+            }
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn canonicalize_parent_allowing_missing(path: &Path) -> Result<PathBuf, String> {
+    let mut existing = path;
+    let mut missing: Vec<OsString> = Vec::new();
+
+    while !existing.exists() {
+        let name = existing
+            .file_name()
+            .ok_or_else(|| format!("export target has no existing ancestor: {}", path.display()))?;
+        missing.push(name.to_os_string());
+        existing = existing
+            .parent()
+            .ok_or_else(|| format!("export target has no existing ancestor: {}", path.display()))?;
+    }
+
+    if !existing.is_dir() {
+        return Err(format!(
+            "export target parent is not a directory: {}",
+            existing.display()
+        ));
+    }
+
+    let mut resolved = std::fs::canonicalize(existing).map_err(|error| {
+        format!(
+            "failed to resolve export target parent {}: {error}",
+            existing.display()
+        )
+    })?;
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+
+    Ok(resolved)
+}
+
+fn validate_export_target_in_data(target: &Path, data_dir: &Path) -> Result<(), String> {
+    let normalized_target = normalize_absolute_path(target)?;
+    let target_parent = normalized_target.parent().ok_or_else(|| {
+        format!(
+            "export target has no parent directory: {}",
+            target.display()
+        )
+    })?;
+
+    let canonical_data = std::fs::canonicalize(data_dir).map_err(|error| {
+        format!(
+            "failed to resolve portable data directory {}: {error}",
+            data_dir.display()
+        )
+    })?;
+    if !canonical_data.is_dir() {
+        return Err(format!(
+            "portable data path is not a directory: {}",
+            data_dir.display()
+        ));
+    }
+
+    let resolved_parent = canonicalize_parent_allowing_missing(target_parent)?;
+    if !resolved_parent.starts_with(&canonical_data) {
+        return Err(format!(
+            "portable mode only allows exports inside {}",
+            data_dir.display()
+        ));
+    }
+
+    match std::fs::symlink_metadata(&normalized_target) {
+        Ok(_) => {
+            let resolved_target = std::fs::canonicalize(&normalized_target).map_err(|error| {
+                format!(
+                    "failed to resolve existing export target {}: {error}",
+                    normalized_target.display()
+                )
+            })?;
+            if resolved_target.is_dir() {
+                return Err(format!(
+                    "export target is a directory: {}",
+                    target.display()
+                ));
+            }
+            if !resolved_target.starts_with(&canonical_data) {
+                return Err(format!(
+                    "portable mode only allows exports inside {}",
+                    data_dir.display()
+                ));
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect export target {}: {error}",
+                normalized_target.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_portable_export_target(target: &Path) -> Result<(), String> {
+    if let Some(paths) = crate::portable::paths() {
+        validate_export_target_in_data(target, paths.data_dir())?;
+    }
+    Ok(())
+}
+
+fn portable_save_target(data_dir: &Path, default_name: &str) -> Result<PathBuf, String> {
+    let export_dir = data_dir.join("exports");
+    let target = export_dir.join(safe_portable_export_file_name(default_name));
+
+    validate_export_target_in_data(&target, data_dir)?;
+    std::fs::create_dir_all(&export_dir).map_err(|error| {
+        format!(
+            "failed to create portable export directory {}: {error}",
+            export_dir.display()
+        )
+    })?;
+
+    validate_export_target_in_data(&target, data_dir)?;
+    Ok(target)
+}
+
 /// 导出数据库为 SQL 备份
 #[tauri::command]
 pub async fn export_config_to_file(
@@ -36,6 +216,7 @@ pub async fn export_config_to_file(
     let db = state.db.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let target_path = PathBuf::from(&filePath);
+        validate_portable_export_target(&target_path).map_err(AppError::Message)?;
         db.export_sql(&target_path)?;
         Ok::<_, AppError>(json!({
             "success": true,
@@ -102,13 +283,16 @@ pub async fn save_file_dialog<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     #[allow(non_snake_case)] defaultName: String,
 ) -> Result<Option<String>, String> {
+    if let Some(paths) = crate::portable::paths() {
+        let target = portable_save_target(paths.data_dir(), &defaultName)?;
+        return Ok(Some(target.to_string_lossy().into_owned()));
+    }
     let dialog = app.dialog();
     let result = dialog
         .file()
         .add_filter("SQL", &["sql"])
         .set_file_name(&defaultName)
         .blocking_save_file();
-
     Ok(result.map(|p| p.to_string()))
 }
 
