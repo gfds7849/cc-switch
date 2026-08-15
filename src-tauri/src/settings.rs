@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use crate::app_config::AppType;
@@ -564,11 +564,9 @@ impl Default for AppSettings {
 impl AppSettings {
     fn settings_path() -> Option<PathBuf> {
         // settings.json 保留用于旧版本迁移和无数据库场景
-        Some(
-            crate::config::get_home_dir()
-                .join(".cc-switch")
-                .join("settings.json"),
-        )
+        Some(settings_path_for_app_dir(
+            &crate::config::get_app_config_dir(),
+        ))
     }
 
     fn normalize_paths(&mut self) {
@@ -673,6 +671,10 @@ impl AppSettings {
             Self::default()
         }
     }
+}
+
+fn settings_path_for_app_dir(app_dir: &Path) -> PathBuf {
+    app_dir.join("settings.json")
 }
 
 fn save_settings_file(settings: &AppSettings) -> Result<(), AppError> {
