@@ -6,7 +6,7 @@ on:
       version:
         description: Portable archive version label
         required: true
-        default: v3.17.0
+        default: v3.19.2
         type: string
 
 permissions:
